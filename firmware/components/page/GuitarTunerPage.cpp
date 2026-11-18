@@ -41,6 +41,7 @@ void GuitarTunerPage::close() {
     inmp441->close();
     delete inmp441;
 
+    motor->stopSoft();
     delete motor;
     printf("closed GuitarTunerPage!\n");
 }

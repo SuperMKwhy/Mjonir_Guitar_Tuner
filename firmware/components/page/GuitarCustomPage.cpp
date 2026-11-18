@@ -132,6 +132,8 @@ void GuitarCustomPage::tick() {
                 }
                 default:{}
             }
+            if(selecting) backTemp = currentMidi; // remember note so Back can restore it
+
         }else if(system->pressedBack()) {
             exit = true;
         }

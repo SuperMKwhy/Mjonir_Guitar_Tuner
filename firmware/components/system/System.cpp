@@ -254,7 +254,8 @@ void System::setupNoteMap(float a4) {
     
     for (int midi = 0; midi <= 127; ++midi) {
         double freq = a4 * std::pow(2.0, (midi - 69) / 12.0);
-        if (freq < 30.0 || freq > 500.0) continue;
+        // Must cover custom-page range (MIDI 32..75) plus +-1 semitone scale bounds (up to E5 ~659 Hz)
+        if (freq < 30.0 || freq > 700.0) continue;
 
         int octave = (midi / 12) - 1;
         std::string note = noteNames[midi % 12] + std::to_string(octave);

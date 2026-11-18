@@ -41,7 +41,7 @@ void FFTDevice::write(int value){
 int FFTDevice::ioctl(Command cmd, void* out) {
     switch(cmd) {
         case Command::read_freq: {
-            dev->ioctl(Command::read_test, input); //read_samples
+            dev->ioctl(Command::read_samples, input);
 
             for (int i = 0 ; i < sample_size ; i++) {
                 //printf("gen %d = %d\n", i, gen[i]);
@@ -155,7 +155,7 @@ int FFTDevice::ioctl(Command cmd, int16_t* input, void* out) {
             return 0;
         }
         case Command::read_freq_bound: {
-            dev->ioctl(Command::read_test, this->input); //read_samples
+            dev->ioctl(Command::read_samples, this->input);
 
             for (int i = 0 ; i < sample_size ; i++) {
                 //printf("gen %d = %d\n", i, gen[i]);

@@ -95,7 +95,7 @@ void Control::moveTo(float error){
         moveSpeed(-10);
     }else if(error >= 0.025 && error < 0.05){
         moveSpeed(-20);
-    }else if(error >= 0.05 && error < -0.1){
+    }else if(error >= 0.05 && error < 0.1){
         moveSpeed(-50);
     }else if(error >= 0.1){
         moveSpeed(-100);
