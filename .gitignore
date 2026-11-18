@@ -1,0 +1,8 @@
+build/
+managed_components/
+sdkconfig.old
+*.kicad_prl
+_autosave-*
+*-bak
+*.bak
+fp-info-cache

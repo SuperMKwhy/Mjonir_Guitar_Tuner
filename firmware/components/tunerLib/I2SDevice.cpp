@@ -1,0 +1,188 @@
+#include "include/I2SDevice.h"
+
+I2SDevice::I2SDevice(int WS, int SCK, int SD, int SP, int FS, int DF) : I2S_WS(WS), I2S_SCK(SCK), I2S_SD(SD), sample_size(SP), fs(FS), down_factor(DF) {}
+
+void I2SDevice::open(){
+    i2s_config_t i2s_config = {};
+    i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    i2s_config.sample_rate = fs;
+    i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+    i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    i2s_config.dma_desc_num = 8;
+    i2s_config.dma_frame_num = 1024;
+    i2s_config.use_apll = false;
+    i2s_config.tx_desc_auto_clear = false;
+    i2s_config.fixed_mclk = 0;
+
+    i2s_pin_config_t pin_config = {};
+    pin_config.bck_io_num = I2S_SCK;
+    pin_config.ws_io_num = I2S_WS;
+    pin_config.data_out_num = I2S_PIN_NO_CHANGE;
+    pin_config.data_in_num = I2S_SD;
+    pin_config.mck_io_num = I2S_PIN_NO_CHANGE;
+
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+
+    if (err != ESP_OK) {
+        printf("Failed to install I2S driver: %s\n", esp_err_to_name(err));
+        while(1) vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    err = i2s_set_pin(I2S_NUM_0, &pin_config);
+    if (err != ESP_OK) {
+        printf("Failed to set I2S pins: %s\n", esp_err_to_name(err));
+        while(1) vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    i2s_start(I2S_NUM_0);
+
+    samples = (int32_t*)heap_caps_aligned_alloc(16, input_size * sizeof(int32_t), MALLOC_CAP_8BIT);
+    temp = (int16_t*)heap_caps_aligned_alloc(16, input_size * sizeof(int16_t), MALLOC_CAP_8BIT);
+    filtered = (int16_t*)heap_caps_aligned_alloc(16, input_size * sizeof(int16_t), MALLOC_CAP_8BIT);
+
+    printf("INMP441 initialized successfully!\n");
+}
+
+void I2SDevice::close(){
+    i2s_stop(I2S_NUM_0);
+    i2s_driver_uninstall(I2S_NUM_0);
+
+    heap_caps_free(filtered);
+    heap_caps_free(temp);
+    heap_caps_free(samples);
+    printf("INMP441 closed successfully!\n");
+}
+
+int I2SDevice::ioctl(Command cmd, void* out) {
+    switch(cmd) {
+        case Command::read_rms: {
+            size_t bytesRead = 0;
+
+            // อ่านข้อมูลเสียงพร้อมตรวจสอบ error
+            esp_err_t result = i2s_read(I2S_NUM_0, (void*)samples, sample_size * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+            if (result != ESP_OK) {
+                printf("I2S read error: %s\n", esp_err_to_name(result));
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                *((int*)out) = 0;
+                return -1;
+            }
+            if (bytesRead == 0) {
+                printf("No audio data received\n");
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                *((int*)out) = 0;
+                return -1;
+            }
+            int numSamples = bytesRead / sizeof(int32_t);
+
+            // Calculate DC offset
+            int64_t dcSum = 0;
+            for (int i = 0; i < numSamples; i++) {
+                dcSum += (samples[i] >> 14); // or >> 16, or >> 8, depending on your mic
+            }
+            int16_t dcOffset = dcSum / numSamples;
+
+            // Calculate RMS (subtract DC offset)
+            int64_t rmsSum = 0;
+            for (int i = 0; i < numSamples; i++) {
+                int16_t acSample = (samples[i] >> 14) - dcOffset;
+                rmsSum += (int64_t)acSample * acSample;
+            }
+            *((int*)out) = (int)sqrt((double)rmsSum / numSamples);
+            
+            return 0;
+        }
+        case Command::read_samples: {
+            // Allocate a larger buffer to read enough samples for downsampling
+            size_t bytesRead = 0;
+
+            esp_err_t result = i2s_read(I2S_NUM_0, (void*)samples, input_size * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+            if (result != ESP_OK) {
+                printf("I2S read error: %s\n", esp_err_to_name(result));
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                return -1;
+            }
+            if (bytesRead == 0) {
+                printf("No audio data received\n");
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                return -1;
+            }
+
+            int numSamples = bytesRead / sizeof(int32_t);
+            if (numSamples < input_size) {
+                printf("Not enough samples read for downsampling\n");
+                return -1;
+            }
+            
+            int64_t dcSum = 0;
+            for (int i = 0; i < input_size; i++) {
+                temp[i] = (int16_t)(samples[i] >> 14); // หรือ >> 16, แล้วแต่กรณี
+                dcSum += temp[i];
+            }
+            int16_t dcOffset = dcSum / input_size;
+            for (int i = 0; i < input_size; i++) {
+                temp[i] = temp[i] - dcOffset;
+            }
+
+            // --- Lowpass FIR filter (cutoff ~1000Hz) ---
+            // Example: 21-tap lowpass FIR, fs = 11025, cutoff ~1000Hz
+            // Coefficients generated by Python/scipy or online tool
+            const int FIR_TAPS = 101;
+            const float fir_coeffs[FIR_TAPS] = {
+                -0.00011140, 0.00017950, 0.00044022, 0.00059411, 0.00057645, 0.00035532, -0.00004621, -0.00053673, -0.00096439, -0.00115283, 
+                -0.00096141, -0.00035226, 0.00056254, 0.00152042, 0.00216879, 0.00217882, 0.00138041, -0.00013104, -0.00196559, -0.00351755, 
+                -0.00414579, -0.00340810, -0.00127114, 0.00178923, 0.00485720, 0.00682359, 0.00675256, 0.00425628, -0.00025776, -0.00557943, 
+                -0.00997446, -0.01170030, -0.00961897, -0.00370994, 0.00471136, 0.01319342, 0.01876971, 0.01886389, 0.01222991, -0.00036821, 
+                -0.01598881, -0.02998076, -0.03703108, -0.03255417, -0.01405965, 0.01789185, 0.05944939, 0.10407200, 0.14386465, 0.17133653, 
+                0.18113957, 0.17133653, 0.14386465, 0.10407200, 0.05944939, 0.01789185, -0.01405965, -0.03255417, -0.03703108, -0.02998076, 
+                -0.01598881, -0.00036821, 0.01222991, 0.01886389, 0.01876971, 0.01319342, 0.00471136, -0.00370994, -0.00961897, -0.01170030, 
+                -0.00997446, -0.00557943, -0.00025776, 0.00425628, 0.00675256, 0.00682359, 0.00485720, 0.00178923, -0.00127114, -0.00340810, 
+                -0.00414579, -0.00351755, -0.00196559, -0.00013104, 0.00138041, 0.00217882, 0.00216879, 0.00152042, 0.00056254, -0.00035226, 
+                -0.00096141, -0.00115283, -0.00096439, -0.00053673, -0.00004621, 0.00035532, 0.00057645, 0.00059411, 0.00044022, 0.00017950, 
+                -0.00011140
+            };
+            
+            for (int i = 0; i < input_size; i++) {
+                float acc = 0;
+                for (int j = 0; j < FIR_TAPS; j++) {
+                    int idx = i - j;
+                    if (idx >= 0) acc += fir_coeffs[j] * temp[idx];
+                }
+                filtered[i] = (int16_t)acc;
+            }
+
+            // Downsample: pick every down_factor-th sample to fill output buffer
+            int16_t* out16 = (int16_t*)out;
+            float avg = 0;
+            for (int i = 0; i < sample_size; i++) {
+                //out16[i] = filtered[i * down_factor];
+                avg = 0;
+                for (int k = -1; k <= 1; ++k) {
+                    int idx = i * down_factor + k;
+                    if (idx >= 0 && idx < input_size)
+                        avg += filtered[idx];
+                }
+                out16[i] = avg / 3;
+            }
+            return sample_size;
+        }
+        case Command::read_test: {
+            float* temp = (float*)heap_caps_aligned_alloc(16, sample_size * sizeof(float), MALLOC_CAP_8BIT);
+            dsps_tone_gen_f32(temp, sample_size, 1.0, 0.09, 0.0);
+
+            int16_t* out16 = (int16_t*)out;
+            for (int i = 0; i < sample_size; i++) {
+                out16[i] = (int16_t)(temp[i] * 32767);  // scale from [-1.0, 1.0] to int16
+            }
+            heap_caps_free(temp);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+void I2SDevice::write(int value){
+
+}
